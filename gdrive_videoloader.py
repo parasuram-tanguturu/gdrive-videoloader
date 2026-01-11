@@ -1,5 +1,10 @@
 from urllib.parse import unquote, urlparse, parse_qs
 import requests
+from requests.adapters import HTTPAdapter
+try:
+    from urllib3.util.retry import Retry
+except ImportError:
+    from requests.packages.urllib3.util.retry import Retry
 import argparse
 import sys
 from tqdm import tqdm
@@ -442,7 +447,7 @@ def interactive_mode() -> None:
     
     # Start download
     print("\nStarting download...\n")
-    main(video_id, None, 1024, False, cookie_file)
+    main(video_id, None, 65536, False, cookie_file)
 
 def load_cookies(cookie_file: str) -> dict:
     """Load cookies from a JSON file and convert to a dictionary."""
@@ -479,9 +484,30 @@ def get_video_url(page_content: str, verbose: bool) -> tuple[str, str]:
         print(f"[INFO] Video Title: {title}")
     return video, title
 
+def get_optimal_chunk_size(file_size: int, user_chunk_size: int = None) -> int:
+    """Determine optimal chunk size based on file size."""
+    if user_chunk_size:
+        return user_chunk_size
+    if file_size < 10 * 1024 * 1024:  # < 10MB
+        return 16 * 1024  # 16KB
+    elif file_size < 100 * 1024 * 1024:  # < 100MB
+        return 64 * 1024  # 64KB
+    elif file_size < 500 * 1024 * 1024:  # < 500MB
+        return 256 * 1024  # 256KB
+    else:  # >= 500MB
+        return 1024 * 1024  # 1MB
+
 def download_file(url: str, cookies: dict, filename: str, chunk_size: int, verbose: bool) -> None:
     """Downloads the file from the given URL with provided cookies, supports resuming."""
-    headers = {}
+    # Validate filename
+    if not filename:
+        print("\n[ERROR] Filename is required for download.")
+        return
+    
+    headers = {
+        'Accept-Encoding': 'gzip, deflate',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
     file_mode = 'wb'
 
     downloaded_size = 0
@@ -495,36 +521,107 @@ def download_file(url: str, cookies: dict, filename: str, chunk_size: int, verbo
         if downloaded_size > 0:
             print(f"[INFO] Resuming download from byte {downloaded_size}")
 
-    try:
-        response = requests.get(url, stream=True, cookies=cookies, headers=headers, timeout=30)
-        if response.status_code in (200, 206):  # 200 for new downloads, 206 for partial content
-            total_size = int(response.headers.get('content-length', 0)) + downloaded_size
-            with open(filename, file_mode) as file:
-                with tqdm(total=total_size, initial=downloaded_size, unit='B', unit_scale=True, desc=filename, file=sys.stdout) as pbar:
-                    for chunk in response.iter_content(chunk_size=chunk_size):
-                        if chunk:
-                            file.write(chunk)
-                            pbar.update(len(chunk))
-            print(f"\n{filename} downloaded successfully.")
-        elif response.status_code == 403:
-            print(f"\n[ERROR] Access denied (403) while downloading {filename}.")
-            print("  - Video may require authentication")
-            print("  - Cookies may have expired")
-            print("  - Your account may not have download permission")
-        elif response.status_code == 404:
-            print(f"\n[ERROR] Video not found (404). The download URL may have expired.")
-        else:
-            print(f"\n[ERROR] Failed to download {filename}, status code: {response.status_code}")
-    except requests.exceptions.Timeout:
-        print(f"\n[ERROR] Download timeout. The connection took too long.")
-        print("  - Check your internet connection")
-        print("  - Try again later")
-    except requests.exceptions.RequestException as e:
-        print(f"\n[ERROR] Network error while downloading: {e}")
-        print("  - Check your internet connection")
-        print("  - Verify the video URL is accessible")
+    # Create session with retry strategy
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
 
-def main(video_id: str, output_file: str = None, chunk_size: int = 1024, verbose: bool = False, cookie_file: str = None) -> None:
+    max_retries = 3
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            response = session.get(url, stream=True, cookies=cookies, headers=headers, timeout=60)
+            
+            if response.status_code in (200, 206):  # 200 for new downloads, 206 for partial content
+                total_size = int(response.headers.get('content-length', 0)) + downloaded_size
+                
+                # Use adaptive chunk sizing by default
+                # If chunk_size is the default (65536), use adaptive; otherwise use user's custom size
+                DEFAULT_CHUNK_SIZE = 65536
+                if chunk_size == DEFAULT_CHUNK_SIZE:
+                    # Use adaptive sizing
+                    optimal_chunk_size = get_optimal_chunk_size(total_size)
+                    if verbose:
+                        print(f"[INFO] Using adaptive chunk size: {optimal_chunk_size // 1024}KB (file size: {total_size / (1024*1024):.1f}MB)")
+                else:
+                    # User specified custom chunk size, use it
+                    optimal_chunk_size = chunk_size
+                    if verbose:
+                        print(f"[INFO] Using custom chunk size: {optimal_chunk_size // 1024}KB")
+                
+                with open(filename, file_mode) as file:
+                    with tqdm(
+                        total=total_size,
+                        initial=downloaded_size,
+                        unit='B',
+                        unit_scale=True,
+                        unit_divisor=1024,
+                        desc=filename,
+                        file=sys.stdout,
+                        bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+                    ) as pbar:
+                        for chunk in response.iter_content(chunk_size=optimal_chunk_size):
+                            if chunk:
+                                file.write(chunk)
+                                pbar.update(len(chunk))
+                
+                print(f"\n{filename} downloaded successfully.")
+                return  # Success, exit retry loop
+                
+            elif response.status_code == 403:
+                print(f"\n[ERROR] Access denied (403) while downloading {filename}.")
+                print("  - Video may require authentication")
+                print("  - Cookies may have expired")
+                print("  - Your account may not have download permission")
+                return
+            elif response.status_code == 404:
+                print(f"\n[ERROR] Video not found (404). The download URL may have expired.")
+                return
+            else:
+                print(f"\n[ERROR] Failed to download {filename}, status code: {response.status_code}")
+                retry_count += 1
+                if retry_count < max_retries:
+                    wait_time = 2 ** retry_count
+                    print(f"Retrying in {wait_time} seconds... (attempt {retry_count + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                else:
+                    return
+                    
+        except requests.exceptions.Timeout:
+            retry_count += 1
+            if retry_count < max_retries:
+                wait_time = 2 ** retry_count
+                print(f"\n[WARNING] Download timeout. Retrying in {wait_time} seconds... (attempt {retry_count + 1}/{max_retries})")
+                time.sleep(wait_time)
+            else:
+                print(f"\n[ERROR] Download timeout after {max_retries} attempts.")
+                print("  - Check your internet connection")
+                print("  - Try again later")
+                return
+        except requests.exceptions.RequestException as e:
+            retry_count += 1
+            if retry_count < max_retries:
+                wait_time = 2 ** retry_count
+                print(f"\n[WARNING] Network error: {e}")
+                print(f"Retrying in {wait_time} seconds... (attempt {retry_count + 1}/{max_retries})")
+                time.sleep(wait_time)
+            else:
+                print(f"\n[ERROR] Network error after {max_retries} attempts: {e}")
+                print("  - Check your internet connection")
+                print("  - Verify the video URL is accessible")
+                return
+        finally:
+            session.close()
+
+def main(video_id: str, output_file: str = None, chunk_size: int = 65536, verbose: bool = False, cookie_file: str = None) -> None:
     """Main function to process video ID and download the video file."""
     drive_url = f'https://drive.google.com/u/0/get_video_info?docid={video_id}&drive_originator_app=303'
 
@@ -564,9 +661,18 @@ def main(video_id: str, output_file: str = None, chunk_size: int = 1024, verbose
     video, title = get_video_url(page_content, verbose)
 
     # Ensure filename has an extension
-    filename = output_file if output_file else title
-    if filename and not os.path.splitext(filename)[1]:
-        filename += '.mp4'  # Default to .mp4 if no extension
+    # Use output_file if provided, otherwise use title (if not None/empty)
+    filename = output_file if output_file else (title if title and title.strip() else None)
+    # Generate default filename if both output_file and title are None/empty/whitespace
+    if not filename or (isinstance(filename, str) and not filename.strip()):
+        filename = f"video_{video_id}.mp4"
+        if verbose:
+            print(f"[INFO] No title found, using default filename: {filename}")
+    else:
+        # Clean up filename (strip whitespace)
+        filename = filename.strip()
+        if not os.path.splitext(filename)[1]:
+            filename += '.mp4'  # Default to .mp4 if no extension
 
     if video:
         if verbose:
@@ -587,7 +693,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Script to download videos from Google Drive.")
     parser.add_argument("video_id", type=str, nargs='?', help="The video ID from Google Drive (e.g., 'abc-Qt12kjmS21kjDm2kjd'). If not provided, interactive mode will start.")
     parser.add_argument("-o", "--output", type=str, help="Optional output file name for the downloaded video (default: video name in gdrive).")
-    parser.add_argument("-c", "--chunk_size", type=int, default=1024, help="Optional chunk size (in bytes) for downloading the video. Default is 1024 bytes.")
+    parser.add_argument("-c", "--chunk_size", type=int, default=65536, help="Optional chunk size (in bytes) for downloading the video. Default is 65536 bytes (64KB). Adaptive sizing is used for default value.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose mode.")
     parser.add_argument("--cookie-file", type=str, help="Path to JSON file containing cookies for authentication.")
     parser.add_argument("--get-cookies", type=str, nargs='?', const="cookies.json", help="Automatically get cookies by opening browser. Optionally specify output file (default: cookies.json).")
